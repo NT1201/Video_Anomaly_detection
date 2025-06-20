@@ -1,0 +1,6 @@
+*
+env/
+data/
+data_old/
+!.gitignore
+!src/
