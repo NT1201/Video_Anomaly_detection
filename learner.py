@@ -1,50 +1,34 @@
-import torch
 import torch.nn as nn
-from torch.nn import functional as F
-
+import torch.nn.functional as F
+import torch
 
 
 class Learner(nn.Module):
-    def __init__(self, input_dim=2048, drop_p=0.0):
-        super(Learner, self).__init__()
-        self.classifier = nn.Sequential(
+    def __init__(self, input_dim, drop_p=0.30, use_attention=False):
+        super().__init__()
+        self.use_attention = use_attention
+
+        self.cls_mlp = nn.Sequential(
             nn.Linear(input_dim, 512),
-            nn.ReLU(),
-            nn.Dropout(0.6),
-            nn.Linear(512, 32),
-            nn.ReLU(),
-            nn.Dropout(0.6),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Dropout(drop_p),
+            nn.Linear(512, 1),        # raw logit
         )
-        self.drop_p = 0.6
-        self.weight_init()
-        self.vars = nn.ParameterList()
 
-        for i, param in enumerate(self.classifier.parameters()):
-            self.vars.append(param)
+        if use_attention:
+            self.att_mlp = nn.Sequential(
+                nn.Linear(input_dim, 128),
+                nn.Tanh(),
+                nn.Linear(128, 1)
+            )
 
-    def weight_init(self):
-        for layer in self.classifier:
-            if type(layer) == nn.Linear:
-                nn.init.xavier_normal_(layer.weight)
+    # --------------------------------------------------------------
+    def forward(self, x, *, return_attention=False):
+        if not self.use_attention:
+            return self.cls_mlp(x)
 
-    def forward(self, x, vars=None):
-        if vars is None:
-            vars = self.vars
-        x = F.linear(x, vars[0], vars[1])
-        x = F.relu(x)
-        x = F.dropout(x, self.drop_p, training=self.training)
-        x = F.linear(x, vars[2], vars[3])
-        x = F.dropout(x, self.drop_p, training=self.training)
-        x = F.linear(x, vars[4], vars[5])
-        return torch.sigmoid(x)
-
-    def parameters(self):
-        """
-        override this function since initial parameters will return with a generator.
-        :return:
-        """
-        return self.vars
-
-
+        att = F.softmax(self.att_mlp(x) / 0.5, dim=0)
+        log = self.cls_mlp(x)
+        if return_attention:
+            return log, att
+        return log

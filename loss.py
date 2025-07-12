@@ -1,33 +1,40 @@
 import torch
 import torch.nn.functional as F
 
-def MIL(y_pred, batch_size, is_transformer=0):
-    loss = torch.tensor(0.).cuda()
-    loss_intra = torch.tensor(0.).cuda()
-    sparsity = torch.tensor(0.).cuda()
-    smooth = torch.tensor(0.).cuda()
-    if is_transformer==0:
-        y_pred = y_pred.view(batch_size, -1)
-    else:
-        y_pred = torch.sigmoid(y_pred)
+# ------------------------------------------------------------------
+def mil_bce_loss(seg_logits, labels, seg_per_video, pos_weight=None):
+    B = labels.size(0)
+    video_logits = seg_logits.view(B, seg_per_video).max(dim=1).values
+    if pos_weight is not None and not torch.is_tensor(pos_weight):
+        pos_weight = torch.tensor(pos_weight, dtype=video_logits.dtype,
+                                  device=video_logits.device)
+    return F.binary_cross_entropy_with_logits(video_logits, labels.float(),
+                                              pos_weight=pos_weight)
 
-    for i in range(batch_size):
-        anomaly_index = torch.randperm(30).cuda()
-        normal_index = torch.randperm(30).cuda()
 
-        y_anomaly = y_pred[i, :32][anomaly_index]
-        y_normal  = y_pred[i, 32:][normal_index]
+# ------------------------------------------------------------------
+def att_mil_bce_with_w(seg_logits, att_w, labels, seg_per_video,
+                       pos_weight=None):
+    B = labels.size(0)
+    seg_logits = seg_logits.view(B, seg_per_video, 1)
+    att_w      = att_w     .view(B, seg_per_video, 1)
+    video_logits = (att_w * seg_logits).sum(1).squeeze(1)
+    if pos_weight is not None and not torch.is_tensor(pos_weight):
+        pos_weight = torch.tensor(pos_weight, dtype=video_logits.dtype,
+                                  device=video_logits.device)
+    return F.binary_cross_entropy_with_logits(video_logits, labels.float(),
+                                              pos_weight=pos_weight)
 
-        y_anomaly_max = torch.max(y_anomaly) # anomaly
-        y_anomaly_min = torch.min(y_anomaly)
 
-        y_normal_max = torch.max(y_normal) # normal
-        y_normal_min = torch.min(y_normal)
-
-        loss += F.relu(1.-y_anomaly_max+y_normal_max)
-
-        sparsity += torch.sum(y_anomaly)*0.00008
-        smooth += torch.sum((y_pred[i,:31] - y_pred[i,1:32])**2)*0.00008
-    loss = (loss+sparsity+smooth)/batch_size
-
-    return loss
+# ------------------------------------------------------------------
+def topk_mil_bce(seg_logits, labels, seg_per_video, k=16, pos_weight=None):
+    B = labels.size(0)
+    seg_logits = seg_logits.view(B, seg_per_video)          # (B,S)
+    k = min(k, seg_per_video)
+    topk_vals, _ = torch.topk(seg_logits, k, dim=1)         # (B,k)
+    video_logits = topk_vals.mean(dim=1)                    # (B,)
+    if pos_weight is not None and not torch.is_tensor(pos_weight):
+        pos_weight = torch.tensor(pos_weight, dtype=video_logits.dtype,
+                                  device=video_logits.device)
+    return F.binary_cross_entropy_with_logits(video_logits, labels.float(),
+                                              pos_weight=pos_weight)

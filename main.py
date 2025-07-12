@@ -1,86 +1,143 @@
-from torch.utils.data import DataLoader
-from learner import Learner
-from loss import *
-from dataset import *
+# main.py
 import os
+import argparse, random, itertools, numpy as np, torch
+from torch.utils.data import DataLoader
 from sklearn import metrics
 
-normal_train_dataset = Normal_Loader(is_train=1)
-normal_test_dataset = Normal_Loader(is_train=0)
+from dataset import VideoFeatureDataset
+from learner import Learner
+from loss    import topk_mil_bce
+from vis     import plot_curves
 
-anomaly_train_dataset = Anomaly_Loader(is_train=1)
-anomaly_test_dataset = Anomaly_Loader(is_train=0)
 
-normal_train_loader = DataLoader(normal_train_dataset, batch_size=30, shuffle=True)
-normal_test_loader = DataLoader(normal_test_dataset, batch_size=1, shuffle=True)
+# ----------------------------------------------------------------------
+def make_loaders(root, feat, batch, seg):
+    n_tr = VideoFeatureDataset(root, "train", "normal",  feat, seg)
+    a_tr = VideoFeatureDataset(root, "train", "anomaly", feat, seg)
+    n_te = VideoFeatureDataset(root, "test",  "normal",  feat, seg)
+    a_te = VideoFeatureDataset(root, "test",  "anomaly", feat, seg)
 
-anomaly_train_loader = DataLoader(anomaly_train_dataset, batch_size=30, shuffle=True) 
-anomaly_test_loader = DataLoader(anomaly_test_dataset, batch_size=1, shuffle=True)
+    g = torch.Generator().manual_seed(0)
+    return (
+        DataLoader(n_tr, batch_size=batch, shuffle=True,  drop_last=True, generator=g),
+        DataLoader(a_tr, batch_size=batch, shuffle=True,  drop_last=True, generator=g),
+        DataLoader(n_te, batch_size=1,     shuffle=False),
+        DataLoader(a_te, batch_size=1,     shuffle=False),
+        n_tr.feat_dim,
+    )
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-model = Learner(input_dim=2048, drop_p=0.0).to(device)
-optimizer = torch.optim.Adagrad(model.parameters(), lr= 0.001, weight_decay=0.0010000000474974513)
-scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[25, 50])
-criterion = MIL
-
-def train(epoch):
-    print('\nEpoch: %d' % epoch)
-    model.train()
-    train_loss = 0
-    correct = 0
-    total = 0
-    for batch_idx, (normal_inputs, anomaly_inputs) in enumerate(zip(normal_train_loader, anomaly_train_loader)):
-        inputs = torch.cat([anomaly_inputs, normal_inputs], dim=1)
-        batch_size = inputs.shape[0]
-        inputs = inputs.view(-1, inputs.size(-1)).to(device)
-        outputs = model(inputs)
-        loss = criterion(outputs, batch_size)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        train_loss += loss.item()
-    print('loss = {}', train_loss/len(normal_train_loader))
-    scheduler.step()
-
-def test_abnormal(epoch):
-    model.eval()
-    auc = 0
+def evaluate(model, ld_a, ld_n, device, seg_per_video):
+    model.eval(); scores, labels = [], []
     with torch.no_grad():
-        for i, (data, data2) in enumerate(zip(anomaly_test_loader, normal_test_loader)):
-            inputs, gts, frames = data
-            inputs = inputs.view(-1, inputs.size(-1)).to(torch.device('cuda'))
-            score = model(inputs)
-            score = score.cpu().detach().numpy()
-            score_list = np.zeros(frames[0])
-            step = np.round(np.linspace(0, frames[0]//16, 33))
+        for v in ld_a:
+            s = model(v.view(-1, v.size(-1)).to(device))
+            scores.append(torch.sigmoid(s).max().item()); labels.append(1)
+        for v in ld_n:
+            s = model(v.view(-1, v.size(-1)).to(device))
+            scores.append(torch.sigmoid(s).max().item()); labels.append(0)
 
-            for j in range(32):
-                score_list[int(step[j])*16:(int(step[j+1]))*16] = score[j]
+    labels = np.asarray(labels, np.int32); scores = np.asarray(scores, np.float32)
+    auc    = metrics.roc_auc_score(labels, scores)
+    prec, rec, thr = metrics.precision_recall_curve(labels, scores); pr_auc = metrics.auc(rec, prec)
+    f1     = 2*prec*rec/(prec+rec+1e-8); idx = f1.argmax()
+    return auc, pr_auc, f1[idx], thr[idx], labels, scores
 
-            gt_list = np.zeros(frames[0])
-            for k in range(len(gts)//2):
-                s = gts[k*2]
-                e = min(gts[k*2+1], frames)
-                gt_list[s-1:e] = 1
 
-            inputs2, gts2, frames2 = data2
-            inputs2 = inputs2.view(-1, inputs2.size(-1)).to(torch.device('cuda'))
-            score2 = model(inputs2)
-            score2 = score2.cpu().detach().numpy()
-            score_list2 = np.zeros(frames2[0])
-            step2 = np.round(np.linspace(0, frames2[0]//16, 33))
-            for kk in range(32):
-                score_list2[int(step2[kk])*16:(int(step2[kk+1]))*16] = score2[kk]
-            gt_list2 = np.zeros(frames2[0])
-            score_list3 = np.concatenate((score_list, score_list2), axis=0)
-            gt_list3 = np.concatenate((gt_list, gt_list2), axis=0)
+def train_epoch(model, opt, ld_norm, ld_anom, device,
+                seg_per_video, k, pos_weight):
+    model.train(); tot = 0.0
+    it_n, it_a = itertools.cycle(ld_norm), itertools.cycle(ld_anom)
+    n_batches  = max(len(ld_norm), len(ld_anom))
+    pw = torch.tensor(pos_weight, device=device) if pos_weight else None
 
-            fpr, tpr, thresholds = metrics.roc_curve(gt_list3, score_list3, pos_label=1)
-            auc += metrics.auc(fpr, tpr)
-        print('auc = ', auc/140)
+    for _ in range(n_batches):
+        v_n, v_a = next(it_n), next(it_a);  B = v_n.size(0)
+        x_n = v_n.view(-1, v_n.size(-1)).to(device)
+        x_a = v_a.view(-1, v_a.size(-1)).to(device)
 
-for epoch in range(0, 75):
-    train(epoch)
-    test_abnormal(epoch)
+        logits = torch.cat([model(x_n), model(x_a)], 0)        # (2B*S,1)
+        labels = torch.cat([torch.zeros(B, device=device),
+                            torch.ones (B, device=device)], 0)
 
+        loss = topk_mil_bce(logits, labels, seg_per_video, k=k, pos_weight=pw)
+        opt.zero_grad(); loss.backward(); opt.step()
+        tot += loss.item()
+    return tot / n_batches
+
+
+# ----------------------------------------------------------------------
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data_root", required=True)
+    p.add_argument("--feat_type", choices=["timesformer", "i3d", "both"], default="both")
+    p.add_argument("--epochs",       type=int,   default=40)
+    p.add_argument("--batch_size",   type=int,   default=30)
+    p.add_argument("--num_segments", type=int,   default=32)
+    p.add_argument("--topk",         type=int,   default=16)
+    p.add_argument("--pos_weight",   type=float, default=5.0)
+    args = p.parse_args()
+
+    # reproducibility
+    random.seed(0); np.random.seed(0); torch.manual_seed(0)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(0)
+
+    # data & model
+    ld_n_tr, ld_a_tr, ld_n_te, ld_a_te, _ = make_loaders(
+        args.data_root, args.feat_type, args.batch_size, args.num_segments)
+
+    feat_dim = {"timesformer": 768, "i3d": 1024, "both": 1792}[args.feat_type]
+    device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model    = Learner(feat_dim).to(device)
+
+    head = [p for n,p in model.named_parameters() if "cls" in n]
+    base = [p for n,p in model.named_parameters() if "cls" not in n]
+    opt  = torch.optim.Adam(
+        [{"params": base, "lr": 6e-4},
+         {"params": head, "lr": 9e-3}],
+        weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=args.epochs, eta_min=1e-5)
+
+    # ---------------------------------------------------------------
+    #  folder for this run's checkpoints
+    run_name = f"{args.feat_type}_{args.num_segments}seg_bs{args.batch_size}"
+    ckpt_dir = os.path.join("checkpoints", run_name)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    # ---------------------------------------------------------------
+
+    best_auc, keep = 0.0, []     # list of (auc, path)
+
+    for ep in range(1, args.epochs + 1):
+        loss = train_epoch(model, opt, ld_n_tr, ld_a_tr, device,
+                           args.num_segments, args.topk, args.pos_weight)
+        auc, pr_auc, f1, thr, y, y_score = evaluate(
+            model, ld_a_te, ld_n_te, device, args.num_segments)
+
+        print(f"Epoch {ep:03d} | loss {loss:.4f}"
+              f" | AUC {auc:.4f} | PR-AUC {pr_auc:.4f}"
+              f" | F1 {f1:.4f} @thr={thr:.3f}")
+        scheduler.step()
+
+        if auc > best_auc:
+            best_auc = auc
+            path = os.path.join(ckpt_dir, f"ep{ep:02d}_{auc:.4f}.pth")
+            torch.save(model.state_dict(), path)
+            keep.append((auc, path)); keep = sorted(keep)[-3:]  # keep best-3
+
+    # average best-3
+    avg = {}
+    for _, path in keep:
+        w = torch.load(path)
+        for k,v in w.items():
+            avg[k] = avg.get(k, 0) + v / len(keep)
+    model.load_state_dict(avg)
+    auc, pr_auc, f1, thr, y, y_score = evaluate(
+        model, ld_a_te, ld_n_te, device, args.num_segments)
+    print(f"\nAveraged best-3 → AUC {auc:.4f} | PR-AUC {pr_auc:.4f}")
+
+    plot_curves(y, y_score, f"curves_{args.feat_type}")
+
+
+if __name__ == "__main__":
+    main()
