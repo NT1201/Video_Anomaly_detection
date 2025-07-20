@@ -88,21 +88,10 @@ Output images and interactive plots will be saved in `plots/`.
 | Tian et al. 2021                              | I3D + smoothness, sparsity    | 84.30             |
 | Sultani et al. 2018 (original MIL ranking)    | I3D                           | 75.41             |
 
-## 📍 Citation
 
-If this work helps your research, please cite:
-
-```bibtex
-@article{your_name2024anomaly,
-  title={Weakly-Supervised Anomaly Detection via Feature Fusion and Top-k MIL},
-  author={Your Name},
-  journal={Your Institution Report},
-  year={2024}
-}
-```
 
 ## 🛠 Acknowledgements
 
-- UCF-Crime Dataset: https://webpages.uncc.edu/cchen62/dataset.html
+- UCF-Crime Dataset: https://www.kaggle.com/datasets/odins0n/ucf-crime-dataset
 - MIL Loss based on: Sultani et al., 2018
 - Transformer features via TimeSformer
